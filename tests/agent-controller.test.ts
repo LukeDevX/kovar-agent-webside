@@ -33,6 +33,26 @@ describe('AgentController', () => {
     })
   })
 
+  it.each([
+    ['给我的 Kovar 账户充值4万', '40000'],
+    ['Kovar topup 2.5k', '2500'],
+    ['Kovar 充值 40,000', '40000'],
+  ])('keeps a normalized requested topup amount: %s', (input, amount) => {
+    expect(controller.decide(input)).toMatchObject({
+      type: 'kovar_tool',
+      tool: 'topup.info',
+      args: { amount },
+    })
+  })
+
+  it('extracts the trade number from a friendly topup status request', () => {
+    expect(controller.decide('查询 Kovar 充值状态 AXONE-7-test')).toMatchObject({
+      type: 'kovar_tool',
+      tool: 'topup.status',
+      args: { tradeNumber: 'AXONE-7-test' },
+    })
+  })
+
   it('routes AXUSD lookup to the wallet', () => {
     expect(controller.decide('查看我的 AXUSD')).toMatchObject({
       type: 'wallet_tool',

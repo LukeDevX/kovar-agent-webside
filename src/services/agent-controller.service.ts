@@ -75,12 +75,23 @@ function cleanKovarPrompt(input: string, model?: string): string {
   return prompt.replace(/^\s*(?:帮我|来|to)\s*/i, '').trim() || input.trim()
 }
 
+function extractTopupAmount(input: string): string | undefined {
+  const match = input.match(/(?:充值|topup|amount)[^\d]{0,20}([\d,]+(?:\.\d+)?)\s*(万|千|[kw])?/i)
+  if (!match?.[1]) return undefined
+
+  const numeric = Number(match[1].replaceAll(',', ''))
+  const unit = match[2]?.toLowerCase()
+  const multiplier = unit === '万' || unit === 'w' ? 10_000 : unit === '千' || unit === 'k' ? 1_000 : 1
+  const amount = numeric * multiplier
+  return Number.isSafeInteger(amount) && amount > 0 ? String(amount) : undefined
+}
+
 function kovarTool(input: string): AgentDecision | undefined {
   if (!/Kovar/i.test(input)) return undefined
   if (/(?:登录|登入|log\s*in|login)/i.test(input)) return { type: 'request_kovar_login' }
 
-  const tradeNumber = input.match(/(?:trade(?:_no)?|订单号)[：:\s]+([A-Za-z0-9_-]+)/i)?.[1]
-  const topupAmount = input.match(/(?:充值|topup|amount)[^\d]{0,20}(\d+)/i)?.[1]
+  const tradeNumber = input.match(/(?:trade(?:_no)?|订单号|充值状态)[：:\s]+([A-Za-z0-9_-]+)/i)?.[1]
+  const topupAmount = extractTopupAmount(input)
   const currency = input.match(/\b(USDC|USDT|USD|AXUSD)\b/i)?.[1]?.toUpperCase()
   const chainId = input.match(/(?:chain(?:_id)?|链)[：:\s]+([A-Za-z0-9_-]+)/i)?.[1]
   const paymentWallet = input.match(addressPattern)?.[0]
@@ -118,7 +129,11 @@ function kovarTool(input: string): AgentDecision | undefined {
   ]
   for (const [pattern, tool] of definitions) {
     if (pattern.test(input)) {
-      return agentDecisionSchema.parse({ type: 'kovar_tool', tool, args: {} })
+      return agentDecisionSchema.parse({
+        type: 'kovar_tool',
+        tool,
+        args: tool === 'topup.info' && topupAmount ? { amount: topupAmount } : {},
+      })
     }
   }
   return undefined

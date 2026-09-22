@@ -2,6 +2,8 @@
 
 import { CheckCircle2, CircleDashed, Coins, KeyRound, RefreshCw, Shield, WalletCards } from 'lucide-react'
 
+import type { KovarConnectionState } from '@/features/agent/agent-session'
+
 export type AgentState = 'unknown' | 'unregistered' | 'pending' | 'approved' | 'suspended' | 'revoked'
 
 type Props = {
@@ -10,7 +12,7 @@ type Props = {
   agentState: AgentState
   isAgentPending: boolean
   availableQuota?: number
-  isKovarReady: boolean
+  kovarState: KovarConnectionState
   onAgentAction: () => void
   onLogin: () => void
 }
@@ -25,6 +27,17 @@ function agentLabel(state: AgentState): string {
     revoked: 'Revoked',
   }
   return labels[state]
+}
+
+function agentActionLabel(state: AgentState): string {
+  if (state === 'unknown') return 'Check agent status'
+  if (state === 'unregistered') return 'Register agent'
+  return 'Refresh status'
+}
+
+function kovarLabel(state: KovarConnectionState): string {
+  if (state === 'unknown') return 'Not checked'
+  return state === 'ready' ? 'Ready' : 'Not connected'
 }
 
 export function AgentSidebar(props: Props) {
@@ -45,8 +58,8 @@ export function AgentSidebar(props: Props) {
           </div>
           <div className="status-row">
             <span className="status-icon"><KeyRound size={16} /></span>
-            <div><span>Kovar</span><strong>{props.isKovarReady ? 'Ready' : 'Not connected'}</strong></div>
-            <span className={`status-light ${props.isKovarReady ? 'is-on' : ''}`} />
+            <div><span>Kovar</span><strong>{kovarLabel(props.kovarState)}</strong></div>
+            <span className={`status-light ${props.kovarState === 'ready' ? 'is-on' : ''}`} />
           </div>
           <div className="status-row">
             <span className="status-icon"><Coins size={16} /></span>
@@ -56,10 +69,10 @@ export function AgentSidebar(props: Props) {
         {props.isConnected ? (
           <button className="secondary-button full-width" disabled={props.isAgentPending} onClick={props.onAgentAction} type="button">
             <RefreshCw className={props.isAgentPending ? 'spin' : ''} size={14} />
-            {props.agentState === 'unregistered' ? 'Register agent' : 'Refresh agent'}
+            {agentActionLabel(props.agentState)}
           </button>
         ) : null}
-        {props.agentState === 'approved' && !props.isKovarReady ? (
+        {props.agentState === 'approved' && props.kovarState === 'not_connected' ? (
           <button className="text-button" onClick={props.onLogin} type="button">Connect Kovar account</button>
         ) : null}
       </section>

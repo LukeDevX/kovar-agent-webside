@@ -27,11 +27,22 @@ import { useAccount, usePublicClient, useSignMessage, useWalletClient } from 'wa
 
 import { appConfig } from '@/config/app'
 import { erc20Abi } from '@/contracts/abi/erc20'
+import {
+  readKovarConnection,
+  type AccountResponse,
+  type KovarConnectionState,
+} from '@/features/agent/agent-session'
 import { normalizeAgentState } from '@/features/agent/agent-state'
 import { AgentSidebar, type AgentState } from '@/features/chat/components/agent-sidebar'
 import { KovarRequestCard } from '@/features/chat/components/kovar-request-card'
 import { MessageList } from '@/features/chat/components/message-list'
 import { TransactionPreview } from '@/features/chat/components/transaction-preview'
+import {
+  describeTopupChains,
+  describeTopupInfo,
+  describeTopupOrder,
+  describeTopupStatus,
+} from '@/features/chat/topup-response'
 import type {
   ChatMessage,
   PendingKovarRequest,
@@ -67,13 +78,6 @@ type ChallengeResponse = {
   expires_at: string
 }
 
-type AccountResponse = {
-  quota: number
-  used_quota: number
-  available_quota: number
-  request_count: number
-}
-
 type ModelsResponse = { data: Array<{ id: string }> }
 type LoginResponse = { authentication_complete?: boolean; continuation_required?: boolean }
 type TokenResponse = { key_bound?: boolean; status?: string; remain_quota?: number }
@@ -87,6 +91,7 @@ type TaskResponse = {
 
 const controller = new AgentController()
 const costEstimator = new KovarCostEstimator()
+const TRANSIENT_GATEWAY_MESSAGES = new Set(['Kovar Gateway is unavailable'])
 const QUICK_ACTIONS = [
   { icon: CircleDollarSign, label: 'Check Kovar quota', prompt: '查看我的 Kovar 额度' },
   { icon: Sparkles, label: 'Kovar models', prompt: '查看 Kovar 可用模型' },
@@ -146,6 +151,7 @@ function restoreMessages(address: string): ChatMessage[] {
           ((item as ChatMessage).role === 'user' || (item as ChatMessage).role === 'assistant') &&
           typeof (item as ChatMessage).content === 'string',
       )
+      .filter((message) => !TRANSIENT_GATEWAY_MESSAGES.has(message.content))
       .slice(-60)
   } catch {
     return []
@@ -162,7 +168,7 @@ export function AgentWorkspace() {
   const [isBusy, setIsBusy] = useState(false)
   const [agentState, setAgentState] = useState<AgentState>('unknown')
   const [isAgentPending, setIsAgentPending] = useState(false)
-  const [isKovarReady, setIsKovarReady] = useState(false)
+  const [kovarState, setKovarState] = useState<KovarConnectionState>('unknown')
   const [account, setAccount] = useState<AccountResponse>()
   const [pendingKovar, setPendingKovar] = useState<PendingKovarRequest>()
   const [pendingTransaction, setPendingTransaction] = useState<PendingWalletTransaction>()
@@ -190,13 +196,11 @@ export function AgentWorkspace() {
       if (!address) {
         setMessages([])
         setAgentState('unknown')
-        setIsKovarReady(false)
+        setKovarState('unknown')
         return
       }
-      const agent = localStorage.getItem(`kovar-agent:${address.toLowerCase()}`)
-      const kovar = localStorage.getItem(`kovar-ready:${address.toLowerCase()}`)
-      setAgentState(agent === 'approved' ? 'approved' : agent === 'pending' ? 'pending' : 'unregistered')
-      setIsKovarReady(kovar === 'true')
+      setAgentState('unknown')
+      setKovarState('unknown')
       setMessages(restoreMessages(address.toLowerCase()))
     }, 0)
     return () => window.clearTimeout(timer)
@@ -234,24 +238,42 @@ export function AgentWorkspace() {
 
   function rememberAgent(state: AgentState) {
     setAgentState(state)
-    if (address && (state === 'approved' || state === 'pending')) {
-      localStorage.setItem(`kovar-agent:${address.toLowerCase()}`, state)
+  }
+
+  function rememberKovar(state: KovarConnectionState) {
+    setKovarState(state)
+  }
+
+  function resetKovarSession() {
+    rememberKovar('not_connected')
+    setAccount(undefined)
+  }
+
+  async function refreshKovarSession(client: KovarGatewayClient) {
+    const connection = await readKovarConnection(client)
+    rememberKovar(connection)
+    setAccount(undefined)
+    if (connection === 'ready') {
+      setAccount(await client.request<AccountResponse>('/api/v1/account'))
     }
   }
 
-  function rememberKovar(ready: boolean) {
-    setIsKovarReady(ready)
-    if (address) localStorage.setItem(`kovar-ready:${address.toLowerCase()}`, String(ready))
-  }
-
-  async function refreshOrRegisterAgent() {
+  async function refreshOrRegisterAgent(shouldRegister: boolean) {
     if (!gateway || !address) return
     setIsAgentPending(true)
     try {
       const agent = await gateway.request<AgentResponse>('/api/v1/agents/me')
-      rememberAgent(normalizeAgentState(agent))
+      const state = normalizeAgentState(agent)
+      rememberAgent(state)
+      if (state === 'approved') await refreshKovarSession(gateway)
+      commitMessages((previous) =>
+        previous.filter((message) => !TRANSIENT_GATEWAY_MESSAGES.has(message.content)),
+      )
     } catch (error) {
       if (isGatewayError(error, 'AGENT_NOT_FOUND')) {
+        rememberAgent('unregistered')
+        resetKovarSession()
+        if (!shouldRegister) return
         try {
           const challenge = await publicGatewayRequest<ChallengeResponse>(
             '/api/v1/agents/challenge',
@@ -266,7 +288,9 @@ export function AgentWorkspace() {
             { address: challenge.address, nonce: challenge.nonce, timestamp, signature },
             createIdempotencyKey(),
           )
-          rememberAgent(normalizeAgentState(agent))
+          const state = normalizeAgentState(agent)
+          rememberAgent(state)
+          if (state === 'approved') await refreshKovarSession(gateway)
           addAssistant(
             agent.whitelist_status === 'APPROVED'
               ? 'Agent is approved and ready.'
@@ -277,10 +301,13 @@ export function AgentWorkspace() {
         }
       } else if (isGatewayError(error, 'AGENT_NOT_WHITELISTED')) {
         rememberAgent('pending')
+        resetKovarSession()
       } else if (isGatewayError(error, 'AGENT_SUSPENDED')) {
         rememberAgent('suspended')
+        resetKovarSession()
       } else if (isGatewayError(error, 'AGENT_REVOKED')) {
         rememberAgent('revoked')
+        resetKovarSession()
       } else {
         addAssistant(friendlyGatewayError(error))
       }
@@ -294,7 +321,7 @@ export function AgentWorkspace() {
     try {
       const token = await client.request<TokenResponse>('/api/v1/agent/token')
       if (token.key_bound) {
-        rememberKovar(true)
+        rememberKovar('ready')
         return
       }
     } catch (error) {
@@ -307,7 +334,7 @@ export function AgentWorkspace() {
       body: {},
       idempotent: true,
     })
-    rememberKovar(true)
+    rememberKovar('ready')
   }
 
   async function login(username: string, password: string) {
@@ -400,7 +427,7 @@ export function AgentWorkspace() {
       await priceKovarRequest(decision.prompt, decision.model, models)
     } catch (error) {
       if (isGatewayError(error, 'KOVAR_USER_NOT_BOUND')) {
-        rememberKovar(false)
+        resetKovarSession()
         setLoginOpen(true)
       }
       addAssistant(friendlyGatewayError(error))
@@ -562,11 +589,12 @@ export function AgentWorkspace() {
       let result: unknown
       if (decision.tool === 'topup.create') {
         const amountText = asString(decision.args.amount)
+        const amount = amountText ? Number(amountText) : Number.NaN
         const currency = asString(decision.args.currency)
         const chain = asString(decision.args.chainId)
         const paymentWallet = asString(decision.args.paymentWallet)
-        if (!amountText || !/^\d+$/.test(amountText) || !currency || !chain || !paymentWallet || !isAddress(paymentWallet)) {
-          addAssistant('创建 Axone 充值订单需要正整数 amount、currency、chain_id 和 payment wallet address。')
+        if (!Number.isSafeInteger(amount) || amount <= 0 || !currency || !chain || !paymentWallet || !isAddress(paymentWallet)) {
+          addAssistant('还不能创建订单。请提供正整数充值金额、币种、链 ID，以及实际付款的有效钱包地址。\n\n示例：“创建 Kovar 充值订单 40000 USDC，链：<chain_id>，付款钱包：0x...”')
           return
         }
         result = await gateway.request<unknown>('/api/v1/account/topup', {
@@ -575,17 +603,15 @@ export function AgentWorkspace() {
           body: {
             provider: 'axone',
             payload: {
-              amount: Number.parseInt(amountText, 10),
+              amount,
               currency,
               chain_id: chain,
               payment_wallet_address: getAddress(paymentWallet),
             },
           },
         })
-        const order = result as { status?: unknown; trade_no?: unknown; address?: unknown }
-        addAssistant(
-          `充值订单已创建。\nStatus: ${typeof order.status === 'string' ? order.status : 'Pending'}\nTrade no: ${typeof order.trade_no === 'string' ? order.trade_no : '—'}\nPayment address: ${typeof order.address === 'string' ? order.address : '—'}\n\n订单创建不代表支付成功。`,
-        )
+        rememberKovar('ready')
+        addAssistant(describeTopupOrder(result))
         return
       }
       if (decision.tool === 'topup.status') {
@@ -600,7 +626,7 @@ export function AgentWorkspace() {
       } else {
         result = await gateway.request<unknown>(routes[decision.tool])
       }
-      rememberKovar(true)
+      rememberKovar('ready')
       if (decision.tool === 'account.get') {
         const value = result as AccountResponse
         setAccount(value)
@@ -610,12 +636,18 @@ export function AgentWorkspace() {
       } else if (decision.tool === 'models.list') {
         const ids = modelIds(result as ModelsResponse)
         addAssistant(`Kovar 可用模型：\n${ids.map((model) => `• ${model}`).join('\n')}`)
+      } else if (decision.tool === 'topup.info') {
+        addAssistant(describeTopupInfo(result, asString(decision.args.amount)))
+      } else if (decision.tool === 'topup.chains') {
+        addAssistant(describeTopupChains(result))
+      } else if (decision.tool === 'topup.status') {
+        addAssistant(describeTopupStatus(result))
       } else {
         addAssistant(safeSummary(result))
       }
     } catch (error) {
       if (isGatewayError(error, 'KOVAR_USER_NOT_BOUND')) {
-        rememberKovar(false)
+        resetKovarSession()
         setLoginOpen(true)
       }
       addAssistant(friendlyGatewayError(error))
@@ -911,8 +943,8 @@ export function AgentWorkspace() {
             {...(account ? { availableQuota: account.available_quota } : {})}
             isAgentPending={isAgentPending}
             isConnected={isConnected}
-            isKovarReady={isKovarReady}
-            onAgentAction={() => void refreshOrRegisterAgent()}
+            kovarState={kovarState}
+            onAgentAction={() => void refreshOrRegisterAgent(agentState === 'unregistered')}
             onLogin={() => setLoginOpen(true)}
           />
         </div>
